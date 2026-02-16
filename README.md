@@ -21,6 +21,7 @@ Produce a COMPLETE playable MVP, not examples.
 All contracts must compile.
 All apps must run.
 No pseudocode.
+Folder Frontend, hardhat, backend
 
 ################################################
 ################ INFRASTRUCTURE ################
