@@ -1,0 +1,535 @@
+// backend/server.js
+// Auto Battler Backend Server - Starter Template
+// This is a basic implementation to get you started
+
+const express = require('express');
+const cors = require('cors');
+const http = require('http');
+const WebSocket = require('ws');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+// ============ CONFIGURATION ============
+
+const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const BCRYPT_ROUNDS = 10;
+
+// In-memory storage (replace with database in production)
+const users = [];
+const matches = new Map();
+const matchQueue = [];
+const connectedClients = new Map();
+
+// ============ MIDDLEWARE ============
+
+app.use(cors({
+  origin: ['http://localhost:5173', 'http://localhost:3000'],
+  credentials: true
+}));
+app.use(express.json());
+
+// Auth middleware
+const auth = (req, res, next) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ message: 'No token provided' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.userId;
+    req.user = users.find(u => u.id === decoded.userId);
+    next();
+  } catch (error) {
+    res.status(401).json({ message: 'Invalid token' });
+  }
+};
+
+// ============ AUTHENTICATION ROUTES ============
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({ message: 'Missing required fields' });
+    }
+
+    if (users.find(u => u.email === email)) {
+      return res.status(409).json({ message: 'Email already registered' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const userId = uuidv4();
+
+    const user = {
+      id: userId,
+      username,
+      email,
+      password: hashedPassword,
+      characters: [1, 2, 3, 4, 5], // 5 starter characters
+      wins: 0,
+      losses: 0,
+      createdAt: new Date()
+    };
+
+    users.push(user);
+
+    const token = jwt.sign(
+      { userId: user.id },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.status(201).json({
+      message: 'Account created successfully',
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email
+      },
+      token
+    });
+  } catch (error) {
+    console.error('Register error:', error);
+    res.status(500).json({ message: 'Registration failed' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password required' });
+    }
+
+    const user = users.find(u => u.email === email);
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    const isValid = await bcrypt.compare(password, user.password);
+    if (!isValid) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign(
+      { userId: user.id },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      message: 'Login successful',
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email
+      },
+      token
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ message: 'Login failed' });
+  }
+});
+
+app.get('/api/auth/me', auth, (req, res) => {
+  res.json({
+    id: req.user.id,
+    username: req.user.username,
+    email: req.user.email,
+    characters: req.user.characters,
+    wins: req.user.wins,
+    losses: req.user.losses
+  });
+});
+
+// ============ USER ROUTES ============
+
+app.get('/api/users/characters', auth, (req, res) => {
+  const characters = req.user.characters.map(id => getCharacter(id));
+  res.json(characters);
+});
+
+app.post('/api/users/characters', auth, (req, res) => {
+  const { characterId } = req.body;
+  
+  if (!req.user.characters.includes(characterId)) {
+    req.user.characters.push(characterId);
+  }
+  
+  res.status(201).json(getCharacter(characterId));
+});
+
+// ============ MATCH ROUTES ============
+
+app.post('/api/matches/create', auth, (req, res) => {
+  const match = {
+    id: uuidv4(),
+    player1Id: req.userId,
+    player1: req.user,
+    status: 'waiting',
+    createdAt: new Date()
+  };
+
+  matches.set(match.id, match);
+  res.status(201).json(match);
+});
+
+app.get('/api/matches', auth, (req, res) => {
+  const userMatches = Array.from(matches.values()).filter(
+    m => m.player1Id === req.userId || m.player2Id === req.userId
+  );
+  res.json(userMatches);
+});
+
+app.get('/api/matches/:id', auth, (req, res) => {
+  const match = matches.get(req.params.id);
+  if (!match) {
+    return res.status(404).json({ message: 'Match not found' });
+  }
+  res.json(match);
+});
+
+app.put('/api/matches/:id/team', auth, (req, res) => {
+  const { team } = req.body;
+  const match = matches.get(req.params.id);
+
+  if (!match) {
+    return res.status(404).json({ message: 'Match not found' });
+  }
+
+  if (match.player1Id === req.userId) {
+    match.player1Team = team;
+  } else {
+    match.player2Team = team;
+  }
+
+  res.json(match);
+});
+
+// ============ BATTLE ROUTES ============
+
+const CHARACTERS = [
+  {
+    id: 1,
+    name: 'Flame Knight',
+    class: 'warrior',
+    rarity: 'uncommon',
+    hp: 150,
+    attack: 25,
+    defense: 15,
+    speed: 10,
+    skills: ['slash', 'fire_burst']
+  },
+  {
+    id: 2,
+    name: 'Frost Mage',
+    class: 'mage',
+    rarity: 'uncommon',
+    hp: 100,
+    attack: 35,
+    defense: 8,
+    speed: 20,
+    skills: ['frost_bolt', 'blizzard']
+  },
+  {
+    id: 3,
+    name: 'Shadow Rogue',
+    class: 'rogue',
+    rarity: 'common',
+    hp: 80,
+    attack: 30,
+    defense: 5,
+    speed: 25,
+    skills: ['backstab', 'shadow_clone']
+  },
+  {
+    id: 4,
+    name: 'Holy Paladin',
+    class: 'paladin',
+    rarity: 'uncommon',
+    hp: 180,
+    attack: 20,
+    defense: 25,
+    speed: 8,
+    skills: ['shield_bash', 'heal']
+  },
+  {
+    id: 5,
+    name: 'Forest Ranger',
+    class: 'ranger',
+    rarity: 'rare',
+    hp: 110,
+    attack: 28,
+    defense: 12,
+    speed: 22,
+    skills: ['arrow_shot', 'multi_shot']
+  },
+];
+
+function getCharacter(id) {
+  return CHARACTERS.find(c => c.id === id);
+}
+
+app.get('/api/battle/units', (req, res) => {
+  res.json(CHARACTERS);
+});
+
+app.get('/api/battle/units/:id', (req, res) => {
+  const unit = getCharacter(parseInt(req.params.id));
+  if (!unit) {
+    return res.status(404).json({ message: 'Unit not found' });
+  }
+  res.json(unit);
+});
+
+// ============ WEBSOCKET HANDLERS ============
+
+wss.on('connection', (ws) => {
+  console.log('✓ New client connected');
+  ws.isAlive = true;
+
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data);
+      console.log('Message received:', message.type);
+
+      switch (message.type) {
+        case 'search_match':
+          handleSearchMatch(ws, message.payload);
+          break;
+        case 'place_unit':
+          handlePlaceUnit(ws, message.payload);
+          break;
+        case 'start_battle':
+          handleStartBattle(ws, message.payload);
+          break;
+        case 'end_battle':
+          handleEndBattle(ws, message.payload);
+          break;
+      }
+    } catch (error) {
+      console.error('WebSocket message error:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('✗ Client disconnected');
+    connectedClients.delete(ws);
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
+// Heartbeat mechanism
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) {
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+// ============ WEBSOCKET LOGIC ============
+
+function handleSearchMatch(ws, payload) {
+  const { userId } = payload;
+  connectedClients.set(ws, userId);
+
+  console.log('Searching for match for user:', userId);
+
+  if (matchQueue.length > 0) {
+    const opponent = matchQueue.shift();
+    const matchId = uuidv4();
+
+    const match = {
+      id: matchId,
+      player1Id: opponent.userId,
+      player2Id: userId,
+      player1WS: opponent.ws,
+      player2WS: ws,
+      status: 'ready',
+      startedAt: new Date()
+    };
+
+    matches.set(matchId, match);
+
+    // Tell player 1 (opponent)
+    opponent.ws.send(JSON.stringify({
+      type: 'match_created',
+      payload: {
+        matchId,
+        opponent: { id: userId }
+      }
+    }));
+
+    // Tell player 2 (current user)
+    ws.send(JSON.stringify({
+      type: 'match_created',
+      payload: {
+        matchId,
+        opponent: { id: opponent.userId }
+      }
+    }));
+
+    console.log('Match created:', matchId);
+  } else {
+    matchQueue.push({ userId, ws });
+    ws.send(JSON.stringify({
+      type: 'app',
+      payload: { message: 'Searching for opponent...' }
+    }));
+  }
+}
+
+function handlePlaceUnit(ws, payload) {
+  const { matchId, position, unitId } = payload;
+  const match = matches.get(matchId);
+
+  if (!match) return;
+
+  // Send opponent update
+  if (match.player1WS === ws) {
+    match.player2WS?.send(JSON.stringify({
+      type: 'battle_update',
+      payload: {
+        message: `Opponent placed unit at position ${position}`,
+        position,
+        unitId
+      }
+    }));
+  } else {
+    match.player1WS?.send(JSON.stringify({
+      type: 'battle_update',
+      payload: {
+        message: `Opponent placed unit at position ${position}`,
+        position,
+        unitId
+      }
+    }));
+  }
+}
+
+function handleStartBattle(ws, payload) {
+  const { matchId } = payload;
+  const match = matches.get(matchId);
+
+  if (!match) return;
+
+  match.status = 'battling';
+  match.battleStartedAt = new Date();
+
+  // Notify both players
+  match.player1WS?.send(JSON.stringify({
+    type: 'battle_start',
+    payload: { message: 'Battle started!' }
+  }));
+
+  match.player2WS?.send(JSON.stringify({
+    type: 'battle_start',
+    payload: { message: 'Battle started!' }
+  }));
+
+  // Simulate battle after 2 seconds
+  setTimeout(() => simulateBattle(match), 2000);
+}
+
+function simulateBattle(match) {
+  // Simple battle simulation
+  const rounds = Math.floor(Math.random() * 3) + 1;
+  let round = 1;
+
+  const intervalId = setInterval(() => {
+    if (round > rounds) {
+      clearInterval(intervalId);
+      
+      // Determine winner randomly
+      const winner = Math.random() > 0.5 ? 'player1' : 'player2';
+      
+      match.player1WS?.send(JSON.stringify({
+        type: 'battle_end',
+        payload: {
+          winner: winner === 'player1' ? match.player1Id : match.player2Id,
+          result: winner === 'player1' ? 'WIN' : 'LOSS'
+        }
+      }));
+
+      match.player2WS?.send(JSON.stringify({
+        type: 'battle_end',
+        payload: {
+          winner: winner === 'player1' ? match.player1Id : match.player2Id,
+          result: winner === 'player2' ? 'WIN' : 'LOSS'
+        }
+      }));
+
+      return;
+    }
+
+    match.player1WS?.send(JSON.stringify({
+      type: 'battle_update',
+      payload: { message: `Round ${round}: Action occurred` }
+    }));
+
+    match.player2WS?.send(JSON.stringify({
+      type: 'battle_update',
+      payload: { message: `Round ${round}: Action occurred` }
+    }));
+
+    round++;
+  }, 1500);
+}
+
+function handleEndBattle(ws, payload) {
+  const { matchId, winner } = payload;
+  const match = matches.get(matchId);
+
+  if (!match) return;
+
+  match.status = 'completed';
+  match.winner = winner;
+  match.endedAt = new Date();
+
+  console.log('Battle ended. Winner:', winner);
+}
+
+// ============ ERROR HANDLING ============
+
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(500).json({ message: 'Internal server error' });
+});
+
+// ============ SERVER START ============
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+╔════════════════════════════════════════╗
+║  🎮 Auto Battler Server Started       ║
+║                                        ║
+║  Server: http://localhost:${PORT}     ║
+║  WebSocket: ws://localhost:${PORT}    ║
+║                                        ║
+║  Ready for battles! ⚔️                 ║
+╚════════════════════════════════════════╝
+  `);
+});
+
+module.exports = server;
